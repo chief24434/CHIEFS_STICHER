@@ -15,6 +15,16 @@ NATURE_QUERIES = {
     "Snow":"snow winter","Fields":"meadow grass","River":"river waterfall","Sky":"clouds sky",
 }
 
+def get_clip_duration(path):
+    try:
+        r = subprocess.run(
+            ["ffprobe","-v","quiet","-print_format","json","-show_format",path],
+            capture_output=True, text=True, timeout=10)
+        d = json.loads(r.stdout)
+        return float(d["format"]["duration"])
+    except:
+        return 0
+
 def get_videos_pixabay(query, count=20):
     clips = []
     if not PIXABAY_API_KEY:
@@ -50,7 +60,6 @@ def get_videos_pexels(query, count=20):
     return clips
 
 def get_videos(query, count=20):
-    # Pixabay first, Pexels second — combine both
     pixabay = get_videos_pixabay(query, count)
     pexels = get_videos_pexels(query, count)
     seen = set()
@@ -130,7 +139,7 @@ def build_cycling_overlay(valid_imgs, img_w, period, target_secs, stitched, audi
             "-map", map_out, "-map", f"{audio_idx}:a",
             "-c:v","libx264","-preset","fast","-crf","23",
             "-c:a","aac","-b:a","128k",
-            "-t", str(target_secs), "-shortest", output])
+            "-t", str(target_secs), output])
     else:
         cmd = (["ffmpeg","-y"] + inputs + [
             "-filter_complex", fc,
@@ -171,12 +180,12 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         random.shuffle(clips)
         total = 0
         for clip in clips:
-            if total >= per_cat + 60: break
+            if total >= per_cat + 120: break
             all_clips.append(clip)
             total += min(clip["duration"], 30)
 
     if not all_clips:
-        return None, "⚠ No clips found. Check API keys in Space Secrets."
+        return None, "⚠ No clips found. Check API keys."
     random.shuffle(all_clips)
 
     tmpdir = tempfile.mkdtemp()
@@ -187,49 +196,60 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         progress(0.08+(i/len(all_clips))*0.35, desc=f"⬇ Downloading clip {i+1}/{len(all_clips)}...")
         path = os.path.join(tmpdir, f"raw_{i:03d}.mp4")
         if download_clip(clip["url"], path):
-            raw_clips.append(path)
+            # verify clip is valid and get real duration
+            dur = get_clip_duration(path)
+            if dur > 0:
+                raw_clips.append({"path": path, "duration": dur})
+            else:
+                try: os.remove(path)
+                except: pass
+
     if not raw_clips:
         return None, "⚠ Download failed."
 
-    # Stitch with single-pass re-encode — fixes freeze without normalizing each clip
-    progress(0.50, desc="🎬 Stitching + fixing format in one pass...")
+    # Build concat list — loop clips using REAL durations until target is covered
+    progress(0.50, desc="🎬 Stitching clips...")
     stitched = os.path.join(tmpdir, "stitched.mp4")
     lf = stitched + ".txt"
 
-    # Loop clips to fill full duration
     with open(lf,'w') as f:
         total_written = 0
         loops = 0
-        while total_written < target_secs + 10:
-            for p in raw_clips:
-                if total_written >= target_secs + 10: break
-                f.write(f"file '{p}'\n")
-                total_written += 20  # avg clip length estimate
+        need = target_secs + 30  # 30s safety buffer
+        while total_written < need:
+            for clip in raw_clips:
+                if total_written >= need: break
+                f.write(f"file '{clip['path']}'\n")
+                total_written += clip["duration"]
             loops += 1
-            if loops > 20: break
+            if loops > 50: break  # hard safety cap
 
     subprocess.run([
         "ffmpeg","-y",
         "-f","concat","-safe","0","-i",lf,
-        "-t",str(target_secs + 5),
+        "-t",str(target_secs + 10),
         "-vf","scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
         "-c:v","libx264","-preset","ultrafast","-crf","28",
         "-an","-threads","4","-movflags","+faststart",
         stitched
-    ], capture_output=True, timeout=300)
+    ], capture_output=True, timeout=400)
 
     try: os.remove(lf)
     except: pass
-    for p in raw_clips:
-        try: os.remove(p)
+    for clip in raw_clips:
+        try: os.remove(clip["path"])
         except: pass
 
     if not os.path.exists(stitched) or os.path.getsize(stitched) < 1000:
         return None, "⚠ Stitching failed."
 
+    # verify stitched duration
+    stitched_dur = get_clip_duration(stitched)
+    if stitched_dur < target_secs - 5:
+        return None, f"⚠ Stitched video too short ({stitched_dur:.0f}s vs {target_secs:.0f}s needed). Try fewer categories or shorter duration."
+
     progress(0.72, desc="🎨 Applying effects and overlays...")
 
-    # Output filename
     safe_name = "".join(c for c in (video_name or "chiefs_video") if c.isalnum() or c in "._- ").strip()
     if not safe_name: safe_name = "chiefs_video"
     if not safe_name.endswith(".mp4"): safe_name += ".mp4"
@@ -276,11 +296,11 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
                 cmd = ["ffmpeg","-y","-i",stitched,"-i",audio_file,
                        "-filter_complex",f"[0:v]{eff}[out]","-map","[out]","-map","1:a",
                        "-c:v","libx264","-preset","fast","-crf","23",
-                       "-c:a","aac","-b:a","128k","-t",str(target_secs),"-shortest",output]
+                       "-c:a","aac","-b:a","128k","-t",str(target_secs),output]
             else:
                 cmd = ["ffmpeg","-y","-i",stitched,"-i",audio_file,
                        "-map","0:v","-map","1:a","-c:v","copy",
-                       "-c:a","aac","-b:a","128k","-t",str(target_secs),"-shortest",output]
+                       "-c:a","aac","-b:a","128k","-t",str(target_secs),output]
         else:
             if eff:
                 cmd = ["ffmpeg","-y","-i",stitched,"-vf",eff,
@@ -294,7 +314,7 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         if has_audio:
             subprocess.run(["ffmpeg","-y","-i",stitched,"-i",audio_file,
                             "-map","0:v","-map","1:a","-c:v","copy",
-                            "-c:a","aac","-b:a","128k","-t",str(target_secs),"-shortest",output],
+                            "-c:a","aac","-b:a","128k","-t",str(target_secs),output],
                            capture_output=True, timeout=300)
         else:
             subprocess.run(["ffmpeg","-y","-i",stitched,"-c:v","copy","-t",str(target_secs),output],
@@ -304,8 +324,9 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         return None, "⚠ Final merge failed."
 
     mb = os.path.getsize(output)/1024/1024
+    final_dur = get_clip_duration(output)
     progress(1.0)
-    return output, f"✓ DONE! {mins}m {secs_r}s — {len(raw_clips)} clips — {mb:.1f} MB — {safe_name}"
+    return output, f"✓ DONE! {int(final_dur//60)}m {int(final_dur%60)}s — {len(raw_clips)} clips — {mb:.1f} MB — {safe_name}"
 
 LOGO_URL = "https://huggingface.co/spaces/chief24434/stitcher/resolve/main/logo.png"
 
@@ -338,29 +359,7 @@ video { border: 1px solid rgba(0,245,255,0.2) !important; border-radius: 4px !im
 ::-webkit-scrollbar-thumb { background: rgba(0,245,255,0.3); border-radius: 2px; }
 """
 
-with gr.Blocks(
-    css=css, title="CHIEF'S STITCHER",
-    theme=gr.themes.Base(
-        primary_hue=gr.themes.colors.cyan,
-        neutral_hue=gr.themes.colors.slate,
-        font=gr.themes.GoogleFont("Share Tech Mono"),
-    ).set(
-        body_background_fill="#020408",
-        body_text_color="#e0f4ff",
-        block_background_fill="rgba(0,245,255,0.02)",
-        block_border_color="rgba(0,245,255,0.12)",
-        block_label_text_color="#00f5ff",
-        input_background_fill="rgba(0,245,255,0.05)",
-        input_border_color="rgba(0,245,255,0.2)",
-        button_primary_background_fill="transparent",
-        button_primary_text_color="#00f5ff",
-        button_primary_border_color="#00f5ff",
-        checkbox_label_background_fill="rgba(0,245,255,0.03)",
-        checkbox_label_text_color="#8ab4c8",
-        checkbox_border_color="rgba(0,245,255,0.3)",
-    )
-) as demo:
-
+with gr.Blocks(title="CHIEF'S STITCHER") as demo:
     gr.HTML(f"""
     <link rel="manifest" href="/file=manifest.json"/>
     <link rel="icon" type="image/png" href="{LOGO_URL}"/>
@@ -492,10 +491,11 @@ with gr.Blocks(
       <div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:#00f5ff;letter-spacing:2px;margin-bottom:8px">ℹ INFO</div>
       <div style="font-family:'Share Tech Mono',monospace;font-size:10px;color:#4a6a7a;line-height:2">
         • Pixabay + Pexels combined — more variety<br>
-        • Clips looped to always fill exact duration — no short videos<br>
-        • Single pass re-encode — no freeze, fast processing<br>
-        • Images cycle every 10s throughout video<br>
-        • Effect on entire frame · Output: 720p · 16:9<br>
+        • Real clip durations tracked — accurate video length<br>
+        • Clips loop to always fill exact duration<br>
+        • Single pass re-encode — no freeze<br>
+        • Images cycle every 10s · Effect on entire frame<br>
+        • Output: 720p · 16:9 · No watermark<br>
         • <span style="color:#ff3366">⚠ Keep screen ON while generating</span>
       </div>
     </div>
@@ -521,4 +521,28 @@ with gr.Blocks(
         outputs=[video_out, status_out]
     )
 
-demo.launch(server_name="0.0.0.0", server_port=7860)
+demo.launch(
+    server_name="0.0.0.0",
+    server_port=7860,
+    show_api=False,
+    css=css,
+    theme=gr.themes.Base(
+        primary_hue=gr.themes.colors.cyan,
+        neutral_hue=gr.themes.colors.slate,
+        font=gr.themes.GoogleFont("Share Tech Mono"),
+    ).set(
+        body_background_fill="#020408",
+        body_text_color="#e0f4ff",
+        block_background_fill="rgba(0,245,255,0.02)",
+        block_border_color="rgba(0,245,255,0.12)",
+        block_label_text_color="#00f5ff",
+        input_background_fill="rgba(0,245,255,0.05)",
+        input_border_color="rgba(0,245,255,0.2)",
+        button_primary_background_fill="transparent",
+        button_primary_text_color="#00f5ff",
+        button_primary_border_color="#00f5ff",
+        checkbox_label_background_fill="rgba(0,245,255,0.03)",
+        checkbox_label_text_color="#8ab4c8",
+        checkbox_border_color="rgba(0,245,255,0.3)",
+    )
+)
