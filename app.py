@@ -191,6 +191,26 @@ def build_cycling_overlay(valid_imgs, img_w, period, target_secs, stitched, audi
             "-t", str(target_secs), output])
     return cmd
 
+def normalize_one_clip(src_path, dst_path):
+    """
+    Re-encode a single clip to a strictly uniform format (resolution, fps, codec,
+    pixel format, NO audio stream). The ffmpeg concat demuxer requires all inputs
+    to share compatible stream parameters — mixed-source clips from different APIs
+    can silently break mid-concat otherwise, with no clear error. Normalizing each
+    clip individually (done in parallel across clips) avoids that failure mode
+    while still being much faster than re-encoding the whole stitched timeline once.
+    """
+    cmd = [
+        "ffmpeg","-y","-i",src_path,
+        "-vf","scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
+        "-an",
+        "-c:v","libx264","-preset","ultrafast","-crf","30",
+        "-pix_fmt","yuv420p",
+        dst_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    return os.path.exists(dst_path) and os.path.getsize(dst_path) > 1000
+
 def download_and_verify_one(clip, path, skip_static_check=False):
     """Download one clip and verify it. Returns dict or None."""
     if not download_clip(clip["url"], path):
@@ -200,11 +220,25 @@ def download_and_verify_one(clip, path, skip_static_check=False):
     valid = dur > 1.5 and w > 0 and h > 0 and w >= h
     if valid and not skip_static_check and is_static_clip(path, dur):
         valid = False
-    if valid:
-        return {"path": path, "duration": dur}
-    try: os.remove(path)
-    except: pass
-    return None
+    if not valid:
+        try: os.remove(path)
+        except: pass
+        return None
+
+    # Normalize to a uniform format so concat never breaks on mixed sources
+    norm_path = path.replace(".mp4", "_n.mp4")
+    if normalize_one_clip(path, norm_path):
+        try: os.remove(path)
+        except: pass
+        norm_dur = get_clip_duration(norm_path)
+        return {"path": norm_path, "duration": norm_dur if norm_dur > 0 else dur}
+    else:
+        # normalization failed — reject this clip rather than risk breaking concat
+        try: os.remove(path)
+        except: pass
+        try: os.remove(norm_path)
+        except: pass
+        return None
 
 def download_batch_parallel(clips, tmpdir, prefix, target_needed, progress, prog_start, prog_end, max_workers=5):
     """Download a list of clips in parallel, stop early once enough footage collected."""
@@ -258,8 +292,9 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
     needed_total = target_secs + 30  # real verified footage required, with buffer
 
     progress(0.06, desc=f"🔍 Searching clips ({mins}m {secs_r}s)...")
-    # Pull a generous, deduped pool per category — duration estimates from the API
-    # are unreliable, so cast a wide net rather than trusting reported durations.
+    # Pull a deduped pool per category. Search width stays generous (some clips will
+    # get rejected for being static/portrait/etc) but DOWNLOAD effort is scaled to
+    # the actual duration needed below, not the full pool size.
     clip_pool = []
     for cat in nature_cats:
         cat_clips = get_videos(NATURE_QUERIES.get(cat, "nature"), 20)
@@ -272,9 +307,15 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
 
     tmpdir = tempfile.mkdtemp()
 
-    # Download + verify in rounds, re-fetching more candidates each round if still short.
-    # This guarantees we either reach the real target or exhaust reasonable attempts —
-    # no more guessing with a fixed threshold that silently falls short.
+    # Estimate how many clips we actually need, assuming a conservative ~8s average
+    # per clip after rejection losses (~30-40% of candidates typically get filtered
+    # out). Add a safety margin so we don't undershoot, but never download more than
+    # the pool actually has unless a later round genuinely needs more.
+    est_avg_clip_secs = 12
+    rejection_margin = 1.3  # account for clips that get filtered out
+
+    # Download + verify in rounds, only requesting batch sizes proportional to what's
+    # actually still needed — re-fetching more candidates only if genuinely short.
     raw_clips = []
     avail = 0.0
     used_urls = set()
@@ -284,7 +325,13 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
 
     while avail < needed_total and round_num < max_rounds:
         round_num += 1
-        batch = [c for c in clip_pool if c["url"] not in used_urls]
+        remaining_candidates = [c for c in clip_pool if c["url"] not in used_urls]
+
+        # Size this round's batch to roughly what's still needed, not the whole pool
+        still_needed_secs = needed_total - avail
+        round_clip_count = max(3, int((still_needed_secs / est_avg_clip_secs) * rejection_margin))
+        batch = remaining_candidates[:round_clip_count]
+
         if not batch:
             # pool exhausted — fetch a fresh pool with different shuffling/queries
             fresh = []
@@ -292,7 +339,8 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
                 more = get_videos(NATURE_QUERIES.get(cat, "nature"), 20)
                 random.shuffle(more)
                 fresh += more
-            batch = [c for c in fresh if c["url"] not in used_urls]
+            fresh_candidates = [c for c in fresh if c["url"] not in used_urls]
+            batch = fresh_candidates[:round_clip_count]
             if not batch:
                 break  # truly nothing new available, stop trying
 
@@ -360,11 +408,22 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         "ffmpeg","-y",
         "-f","concat","-safe","0","-i",lf,
         "-t",str(needed_total),
-        "-vf","scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
-        "-c:v","libx264","-preset","ultrafast","-crf","28",
-        "-an","-threads","4","-movflags","+faststart",
+        "-c","copy","-movflags","+faststart",
         stitched
     ], capture_output=True, text=True, timeout=400)
+
+    # Fallback: if stream-copy concat fails for any reason, retry with re-encode
+    if not os.path.exists(stitched) or os.path.getsize(stitched) < 1000:
+        stitch_result = subprocess.run([
+            "ffmpeg","-y",
+            "-f","concat","-safe","0","-i",lf,
+            "-t",str(needed_total),
+            "-vf","scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
+            "-c:v","libx264","-preset","ultrafast","-crf","28",
+            "-an","-threads","4","-movflags","+faststart",
+            stitched
+        ], capture_output=True, text=True, timeout=400)
+
 
     try: os.remove(lf)
     except: pass
