@@ -580,17 +580,26 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
                 cmd = ["ffmpeg","-y","-i",stitched,"-c:v","copy","-t",str(target_secs),output]
 
     try:
-        proc_result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        # Raised from 240s — at realistic scale with real photos and slower
+        # CPUs, the image-overlay encode can genuinely need more time. Cutting
+        # it off too early was causing PARTIAL overlay videos (images for the
+        # first chunk, none after) rather than either a clean success or a
+        # clean failure — confirmed by tracing the timeout/fallback logic.
+        proc_result = subprocess.run(cmd, capture_output=True, text=True, timeout=420)
         overlay_timed_out = False
         overlay_stderr = proc_result.stderr or ""
     except subprocess.TimeoutExpired:
         overlay_timed_out = True
         overlay_stderr = ""
 
+    overlay_was_dropped = False
+
     if overlay_timed_out or not os.path.exists(output) or os.path.getsize(output) < 1000:
-        # Overlay/effects step failed or took too long — fall back to a much simpler,
-        # faster path: copy video stream directly (no overlay motion math, no effect
-        # filter), just attach audio. This guarantees SOME output instead of a hang.
+        # The overlay step genuinely failed or ran out of time. Rather than
+        # silently produce a video that LOOKS like overlays partially worked
+        # (which is what was happening before — confusing, looked like a
+        # different bug), clearly mark that overlays were dropped this run.
+        overlay_was_dropped = bool(valid_imgs)
         try:
             if has_audio:
                 subprocess.run(["ffmpeg","-y","-i",stitched,"-i",audio_file,
@@ -609,6 +618,13 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
     mb = os.path.getsize(output)/1024/1024
     final_dur = get_clip_duration(output)
     progress(1.0)
+
+    if overlay_was_dropped:
+        return output, (f"⚠ DONE but image overlays were DROPPED — they took too long to "
+                         f"process for this duration and timed out. {int(final_dur//60)}m "
+                         f"{int(final_dur%60)}s — {len(raw_clips)} clips — {mb:.1f} MB — {safe_name}. "
+                         f"Try fewer/smaller images, or a shorter video.")
+
     return output, f"✓ DONE! {int(final_dur//60)}m {int(final_dur%60)}s — {len(raw_clips)} clips — {mb:.1f} MB — {safe_name}"
 
 LOGO_URL = "https://huggingface.co/spaces/chief24434/stitcher/resolve/main/logo.png"
