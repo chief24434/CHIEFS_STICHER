@@ -5,7 +5,6 @@ import os
 import tempfile
 import subprocess
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "")
@@ -36,33 +35,6 @@ def get_clip_dimensions(path):
         return int(s.get("width",0)), int(s.get("height",0))
     except:
         return 0, 0
-
-def is_static_clip(path, duration):
-    """Detect near-frozen clips by comparing two frames a few seconds apart"""
-    try:
-        sample_t = min(2.0, max(0.3, duration * 0.3))
-        f1 = path + "_f1.jpg"
-        f2 = path + "_f2.jpg"
-        subprocess.run(["ffmpeg","-y","-ss","0.2","-i",path,"-frames:v","1","-vf","scale=64:36",f1],
-                       capture_output=True, timeout=10)
-        subprocess.run(["ffmpeg","-y","-ss",str(sample_t),"-i",path,"-frames:v","1","-vf","scale=64:36",f2],
-                       capture_output=True, timeout=10)
-        if not (os.path.exists(f1) and os.path.exists(f2)):
-            return False
-        size1 = os.path.getsize(f1)
-        size2 = os.path.getsize(f2)
-        # Compare raw bytes difference as a cheap proxy for motion
-        with open(f1,'rb') as a, open(f2,'rb') as b:
-            d1, d2 = a.read(), b.read()
-        diff = sum(1 for x,y in zip(d1,d2) if x != y)
-        ratio = diff / max(len(d1), 1)
-        try: os.remove(f1)
-        except: pass
-        try: os.remove(f2)
-        except: pass
-        return ratio < 0.015  # almost no pixel change = static
-    except:
-        return False
 
 def get_videos_pixabay(query, count=20):
     clips = []
@@ -191,47 +163,6 @@ def build_cycling_overlay(valid_imgs, img_w, period, target_secs, stitched, audi
             "-t", str(target_secs), output])
     return cmd
 
-def download_and_verify_one(clip, path, skip_static_check=False):
-    """Download one clip and verify it. Returns dict or None."""
-    if not download_clip(clip["url"], path):
-        return None
-    dur = get_clip_duration(path)
-    w, h = get_clip_dimensions(path)
-    valid = dur > 1.5 and w > 0 and h > 0 and w >= h
-    if valid and not skip_static_check and is_static_clip(path, dur):
-        valid = False
-    if valid:
-        return {"path": path, "duration": dur}
-    try: os.remove(path)
-    except: pass
-    return None
-
-def download_batch_parallel(clips, tmpdir, prefix, target_needed, progress, prog_start, prog_end, max_workers=5):
-    """Download a list of clips in parallel, stop early once enough footage collected."""
-    results = []
-    total_dur = 0
-    done_count = 0
-    n = len(clips)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {}
-        for i, clip in enumerate(clips):
-            path = os.path.join(tmpdir, f"{prefix}_{i:03d}.mp4")
-            # Skip the slower static-frame check once we already have enough footage
-            skip_check = total_dur >= target_needed
-            futures[ex.submit(download_and_verify_one, clip, path, skip_check)] = i
-
-        for fut in as_completed(futures):
-            done_count += 1
-            if n:
-                progress(prog_start + (done_count/n)*(prog_end-prog_start),
-                          desc=f"⬇ Downloading clips {done_count}/{n}...")
-            res = fut.result()
-            if res:
-                results.append(res)
-                total_dur += res["duration"]
-    return results, total_dur
-
 def generate_video(audio_file, duration_str, video_name, images, img_size, motion_speed, nature_cats, effect, progress=gr.Progress()):
     target_secs = 0
     has_audio = audio_file is not None
@@ -274,30 +205,45 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
 
     tmpdir = tempfile.mkdtemp()
 
-    # Download clips in parallel — much faster for long videos
-    target_needed = target_secs + 30
-    raw_clips, avail = download_batch_parallel(
-        all_clips, tmpdir, "raw", target_needed, progress, 0.08, 0.42, max_workers=5)
+    # Download clips
+    raw_clips = []
+    for i, clip in enumerate(all_clips):
+        progress(0.08+(i/len(all_clips))*0.35, desc=f"⬇ Downloading clip {i+1}/{len(all_clips)}...")
+        path = os.path.join(tmpdir, f"raw_{i:03d}.mp4")
+        if download_clip(clip["url"], path):
+            dur = get_clip_duration(path)
+            w, h = get_clip_dimensions(path)
+            # Reject invalid, too-short, or portrait/square clips
+            if dur > 1.5 and w > 0 and h > 0 and w >= h:
+                raw_clips.append({"path": path, "duration": dur})
+            else:
+                try: os.remove(path)
+                except: pass
 
     if not raw_clips:
-        return None, "⚠ Download failed. Check your internet or API keys."
+        return None, "⚠ Download failed."
 
-    # If total available footage is still too small, fetch and download a second batch
-    if avail < target_needed / 3:
+    # If total available footage is too small relative to target, fetch a second batch
+    avail = sum(c["duration"] for c in raw_clips)
+    if avail < (target_secs + 30) / 3:  # need enough variety to loop sanely
         progress(0.42, desc="🔁 Fetching additional clips for full coverage...")
-        extra_pool = []
         for cat in nature_cats:
             more = get_videos(NATURE_QUERIES.get(cat,"nature"), 20)
             random.shuffle(more)
-            extra_pool += more[:10]
-            if len(extra_pool) >= 20:
+            for clip in more[:10]:
+                idx = len(raw_clips)
+                path = os.path.join(tmpdir, f"extra_{idx:03d}.mp4")
+                if download_clip(clip["url"], path):
+                    dur = get_clip_duration(path)
+                    w, h = get_clip_dimensions(path)
+                    if dur > 1.5 and w > 0 and h > 0 and w >= h:
+                        raw_clips.append({"path": path, "duration": dur})
+                    else:
+                        try: os.remove(path)
+                        except: pass
+            avail = sum(c["duration"] for c in raw_clips)
+            if avail >= (target_secs + 30) / 3:
                 break
-        if extra_pool:
-            extra_clips, extra_dur = download_batch_parallel(
-                extra_pool, tmpdir, "extra", target_needed - avail, progress, 0.42, 0.50, max_workers=5)
-            raw_clips += extra_clips
-            avail += extra_dur
-
 
     # Build concat list — loop clips using REAL durations until target is covered
     progress(0.50, desc="🎬 Stitching clips...")
@@ -533,8 +479,6 @@ with gr.Blocks(title="CHIEF'S STITCHER") as demo:
     </div>
     """)
 
-    example_btn = gr.Button("✨ New here? Try a 1-minute Forest example", size="sm")
-
     audio_file   = gr.Audio(label="🎵 STEP 1A — Upload Audio (MP3/WAV · max 20 min · optional if duration entered)", type="filepath")
     duration_str = gr.Textbox(placeholder="e.g.  10:30  or  630  or  10m30s", label="⏱ STEP 1B — OR Enter Duration Manually (for video only without audio)", lines=1, max_lines=1)
     video_name   = gr.Textbox(placeholder="e.g.  my_video  or  episode_01", label="💾 Output File Name (optional · default: chiefs_video)", lines=1, max_lines=1)
@@ -551,38 +495,34 @@ with gr.Blocks(title="CHIEF'S STITCHER") as demo:
         list(NATURE_QUERIES.keys()), value=["Forest"],
         label="🌿 STEP 4 — Nature Background (select multiple · splits equally)")
 
-    def fill_example():
-        return "1:00", ["Forest"], "None"
-
-
-
     effect = gr.Radio(
         ["None","Film Frame","Grains","Black & White","Film Frame 2",
          "Warm Golden","Cold Blue","Faded Matte","Cinematic","Moody Dark"],
         value="None", label="🎨 STEP 5 — Video Effect (applied to entire frame)")
 
-    example_btn.click(
-        fn=fill_example,
-        inputs=None,
-        outputs=[duration_str, nature_cats, effect]
-    )
-
     gr.HTML("""
-    <div id="time-estimate" style="margin:10px 0;padding:10px 14px;border:1px solid rgba(0,245,255,0.25);border-radius:3px;background:rgba(0,245,255,0.03);font-family:'Share Tech Mono',monospace;font-size:10px;color:#8ab4c8;letter-spacing:1px;line-height:1.8">
-      ⏱ Estimated processing time scales with audio length and category count — typically 2-6x the video duration on free tier.
-    </div>
-    """)
-
-    warning_box = gr.HTML(visible=False, value="""
-    <div style="margin:10px 0;padding:11px 14px;border:1px solid #ff3366;border-radius:3px;font-family:'Share Tech Mono',monospace;font-size:11px;color:#ff3366;background:rgba(255,51,102,0.06);line-height:1.9">
+    <div id="gen-warning" style="display:none;margin:10px 0;padding:11px 14px;border:1px solid #ff3366;border-radius:3px;font-family:'Share Tech Mono',monospace;font-size:11px;color:#ff3366;background:rgba(255,51,102,0.06);line-height:1.9">
       🚨 DO NOT close, minimize or lock your phone!<br>
       Keep this screen ON until the video is fully ready.
     </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function(){
+      setTimeout(function(){
+        document.querySelectorAll('button').forEach(function(b){
+          if(b.innerText && b.innerText.includes('GENERATE')){
+            b.addEventListener('click', function(){
+              document.getElementById('gen-warning').style.display = 'block';
+            });
+          }
+        });
+      }, 2500);
+    });
+    </script>
     """)
 
     run_btn    = gr.Button("🕷 GENERATE VIDEO", variant="primary")
+    status_out = gr.Textbox(label="● STATUS", interactive=False)
     video_out  = gr.Video(label="📹 OUTPUT VIDEO")
-    status_out = gr.Textbox(label="● RESULT", interactive=False, placeholder="Your finished video info will appear here...")
 
     gr.HTML("""
     <div style="margin-top:20px;padding:14px 16px;border:1px solid rgba(0,245,255,0.08);border-radius:3px;background:rgba(0,245,255,0.01)">
@@ -613,35 +553,16 @@ with gr.Blocks(title="CHIEF'S STITCHER") as demo:
     </div>
     """)
 
-    def show_warning_and_validate(audio_file, duration_str, nature_cats):
-        if audio_file is None and not (duration_str and duration_str.strip()):
-            return gr.update(visible=False), "⚠ Please upload audio OR enter a duration before generating."
-        if not nature_cats:
-            return gr.update(visible=False), "⚠ Please select at least one nature category before generating."
-        return gr.update(visible=True), ""
-
-    def clear_warning():
-        return gr.update(visible=False)
-
-    # Show warning + validate BEFORE running generation; only proceed if valid
-    pre_check = run_btn.click(
-        fn=show_warning_and_validate,
-        inputs=[audio_file, duration_str, nature_cats],
-        outputs=[warning_box, status_out]
-    )
-    pre_check.then(
+    run_btn.click(
         fn=generate_video,
         inputs=[audio_file, duration_str, video_name, images, img_size, motion_speed, nature_cats, effect],
         outputs=[video_out, status_out]
-    ).then(
-        fn=clear_warning,
-        inputs=None,
-        outputs=[warning_box]
     )
 
 demo.launch(
     server_name="0.0.0.0",
     server_port=7860,
+   
     css=css,
     theme=gr.themes.Base(
         primary_hue=gr.themes.colors.cyan,
