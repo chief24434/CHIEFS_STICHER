@@ -523,25 +523,14 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
     if not safe_name.endswith(".mp4"): safe_name += ".mp4"
     output = os.path.join(tmpdir, safe_name)
 
-    effect_filters = {
-        "None":"",
-        "Film Frame":"vignette=PI/4",
-        "Grains":"noise=alls=15:allf=t+u",
-        "Black & White":"hue=s=0,curves=preset=strong_contrast",
-        "Film Frame 2":"vignette=PI/3,eq=contrast=1.05:brightness=-0.02:saturation=0.85",
-        "Warm Golden":"curves=r='0/0 0.5/0.6 1/1':g='0/0 0.5/0.5 1/0.9':b='0/0 0.5/0.4 1/0.8'",
-        "Cold Blue":"curves=r='0/0 0.5/0.4 1/0.8':g='0/0 0.5/0.5 1/0.9':b='0/0 0.5/0.6 1/1'",
-        "Faded Matte":"eq=contrast=0.85:brightness=0.05:saturation=0.7,curves=all='0/0.08 1/0.92'",
-        "Cinematic":"eq=contrast=1.2:saturation=0.8,curves=r='0/0 0.5/0.55 1/1':b='0/0 0.5/0.45 1/0.9'",
-        "Moody Dark":"eq=contrast=1.3:brightness=-0.08:saturation=0.75,vignette=PI/3",
-    }
-    effect = gr.Radio(["None"], value="None", visible=False, label="Effect (disabled)")
+    # Video effects feature removed — eff always empty, image overlay still works below
+    eff = ""
 
-    example_btn.click(
-        fn=fill_example,
-        inputs=None,
-        outputs=[duration_str, nature_cats, effect]
-    )
+    try:
+        size_pct = float(img_size.replace('%',''))/100
+    except:
+        size_pct = 0.80
+    img_w = int(1280*size_pct)
 
     try:
         spd = float(motion_speed)
@@ -744,10 +733,7 @@ with gr.Blocks(title="CHIEF'S STITCHER") as demo:
 
 
 
-    effect = gr.Radio(
-        ["None","Film Frame","Grains","Black & White","Film Frame 2",
-         "Warm Golden","Cold Blue","Faded Matte","Cinematic","Moody Dark"],
-        value="None", label="🎨 STEP 5 — Video Effect (applied to entire frame)")
+    effect = gr.Radio(["None"], value="None", visible=False, label="Effect (disabled)")
 
     example_btn.click(
         fn=fill_example,
