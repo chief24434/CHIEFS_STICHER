@@ -199,17 +199,49 @@ def normalize_one_clip(src_path, dst_path):
     can silently break mid-concat otherwise, with no clear error. Normalizing each
     clip individually (done in parallel across clips) avoids that failure mode
     while still being much faster than re-encoding the whole stitched timeline once.
+
+    IMPORTANT: a previous version of this function only checked "does the output
+    file exist and have >1000 bytes" to decide success. That's not reliable —
+    if ffmpeg times out or gets killed mid-encode, a partial file can still exist
+    and pass that check, but be missing its moov atom (file index), making it
+    completely unreadable by the concat demuxer later ("moov atom not found").
+    This version checks the actual process return code AND verifies the output
+    file has a real, readable duration before trusting it.
     """
-    cmd = [
-        "ffmpeg","-y","-i",src_path,
-        "-vf","scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
-        "-an",
-        "-c:v","libx264","-preset","ultrafast","-crf","30",
-        "-pix_fmt","yuv420p",
-        dst_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    return os.path.exists(dst_path) and os.path.getsize(dst_path) > 1000
+    try:
+        result = subprocess.run(
+            ["ffmpeg","-y","-i",src_path,
+             "-vf","scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
+             "-an",
+             "-c:v","libx264","-preset","ultrafast","-crf","30",
+             "-pix_fmt","yuv420p",
+             dst_path],
+            capture_output=True, text=True, timeout=90
+        )
+    except subprocess.TimeoutExpired:
+        # process was killed mid-encode — output file (if any) is unreliable, discard it
+        try: os.remove(dst_path)
+        except: pass
+        return False
+
+    if result.returncode != 0:
+        try: os.remove(dst_path)
+        except: pass
+        return False
+
+    if not os.path.exists(dst_path) or os.path.getsize(dst_path) < 1000:
+        return False
+
+    # Final real check: confirm the output is actually readable and has a valid duration,
+    # not just present on disk. This catches partial/corrupt files the return-code
+    # check alone might miss.
+    real_dur = get_clip_duration(dst_path)
+    if real_dur <= 0:
+        try: os.remove(dst_path)
+        except: pass
+        return False
+
+    return True
 
 def download_and_verify_one(clip, path, skip_static_check=False):
     """Download one clip and verify it. Returns dict or None."""
@@ -260,7 +292,12 @@ def download_batch_parallel(clips, tmpdir, prefix, target_needed, progress, prog
             if n:
                 progress(prog_start + (done_count/n)*(prog_end-prog_start),
                           desc=f"⬇ Downloading clips {done_count}/{n}...")
-            res = fut.result()
+            try:
+                res = fut.result()
+            except Exception:
+                # One bad clip (corrupt download, unexpected ffmpeg failure, etc.)
+                # should never crash the whole batch — just skip it and continue.
+                res = None
             if res:
                 results.append(res)
                 total_dur += res["duration"]
