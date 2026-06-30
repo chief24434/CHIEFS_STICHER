@@ -7,6 +7,13 @@ import subprocess
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Shared session with connection pooling — reusing connections to the same host
+# (Pixabay/Pexels) avoids repeated TCP/TLS handshake overhead on every download.
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "")
 
@@ -85,7 +92,7 @@ def get_videos_pixabay(query, count=20):
     if not PIXABAY_API_KEY:
         return clips
     try:
-        r = requests.get(
+        r = _session.get(
             f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}&q={query}&per_page={count}&video_type=film&orientation=horizontal",
             timeout=15)
         if r.status_code == 200:
@@ -106,7 +113,7 @@ def get_videos_pexels(query, count=20):
     if not PEXELS_API_KEY:
         return clips
     try:
-        r = requests.get(
+        r = _session.get(
             f"https://api.pexels.com/videos/search?query={query}&per_page={count}&orientation=landscape",
             headers={"Authorization": PEXELS_API_KEY}, timeout=15)
         if r.status_code == 200:
@@ -157,10 +164,13 @@ def parse_duration(s):
 
 def download_clip(url, path):
     try:
-        r = requests.get(url, stream=True, timeout=25)
+        # timeout=(connect_timeout, read_timeout) — read_timeout catches a stalled
+        # download mid-stream, not just a failed initial connection.
+        r = _session.get(url, stream=True, timeout=(10, 20))
         if r.status_code == 200:
             with open(path,'wb') as f:
-                for chunk in r.iter_content(65536): f.write(chunk)
+                for chunk in r.iter_content(65536):
+                    f.write(chunk)
             return True
     except: pass
     return False
@@ -291,7 +301,7 @@ def download_and_verify_one(clip, path, skip_static_check=False):
         except: pass
         return None
 
-def download_batch_parallel(clips, tmpdir, prefix, target_needed, progress, prog_start, prog_end, max_workers=5):
+def download_batch_parallel(clips, tmpdir, prefix, target_needed, progress, prog_start, prog_end, max_workers=8):
     """Download a list of clips in parallel, stop early once enough footage collected."""
     results = []
     total_dur = 0
@@ -345,12 +355,19 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
 
     mins = int(target_secs//60)
     secs_r = int(target_secs%60)
-    needed_total = target_secs + 30  # real verified footage required, with buffer
 
-    progress(0.06, desc=f"🔍 Searching clips ({mins}m {secs_r}s)...")
-    # Pull a deduped pool per category. Search width stays generous (some clips will
-    # get rejected for being static/portrait/etc) but DOWNLOAD effort is scaled to
-    # the actual duration needed below, not the full pool size.
+    # ── KEY CHANGE ──
+    # Instead of scaling the download/verify/normalize workload to the FULL target
+    # duration (which is what caused slow downloads, HF timeouts, and repeated
+    # failures for long videos), we cap real downloading at a fixed ~5 minute pool.
+    # That fixed-size pool is then shuffled and looped (with the existing hardlink
+    # trick) to cover whatever the actual target duration is — 5 min or 20 min,
+    # the download phase does the same fixed amount of work either way.
+    DOWNLOAD_CAP_SECS = 300  # 5 minutes — fixed regardless of target_secs
+    download_target = min(target_secs, DOWNLOAD_CAP_SECS)
+    needed_total = download_target + 30  # real verified footage required, with buffer
+
+    progress(0.06, desc=f"🔍 Searching clips (capped at {DOWNLOAD_CAP_SECS//60}min pool)...")
     clip_pool = []
     for cat in nature_cats:
         cat_clips = get_videos(NATURE_QUERIES.get(cat, "nature"), 20)
@@ -363,15 +380,9 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
 
     tmpdir = tempfile.mkdtemp()
 
-    # Estimate how many clips we actually need, assuming a conservative ~8s average
-    # per clip after rejection losses (~30-40% of candidates typically get filtered
-    # out). Add a safety margin so we don't undershoot, but never download more than
-    # the pool actually has unless a later round genuinely needs more.
     est_avg_clip_secs = 12
     rejection_margin = 1.3  # account for clips that get filtered out
 
-    # Download + verify in rounds, only requesting batch sizes proportional to what's
-    # actually still needed — re-fetching more candidates only if genuinely short.
     raw_clips = []
     avail = 0.0
     used_urls = set()
@@ -383,13 +394,11 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         round_num += 1
         remaining_candidates = [c for c in clip_pool if c["url"] not in used_urls]
 
-        # Size this round's batch to roughly what's still needed, not the whole pool
         still_needed_secs = needed_total - avail
         round_clip_count = max(3, int((still_needed_secs / est_avg_clip_secs) * rejection_margin))
         batch = remaining_candidates[:round_clip_count]
 
         if not batch:
-            # pool exhausted — fetch a fresh pool with different shuffling/queries
             fresh = []
             for cat in nature_cats:
                 more = get_videos(NATURE_QUERIES.get(cat, "nature"), 20)
@@ -398,63 +407,67 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
             fresh_candidates = [c for c in fresh if c["url"] not in used_urls]
             batch = fresh_candidates[:round_clip_count]
             if not batch:
-                break  # truly nothing new available, stop trying
+                break
 
         for c in batch:
             used_urls.add(c["url"])
 
         p_start = prog_start + (round_num-1) * (prog_end-prog_start) / max_rounds
         p_end   = prog_start + round_num * (prog_end-prog_start) / max_rounds
-        progress(p_start, desc=f"⬇ Downloading clips (round {round_num}, {avail:.0f}s/{needed_total:.0f}s so far)...")
+        progress(p_start, desc=f"⬇ Downloading clips (round {round_num}, {avail:.0f}s/{needed_total:.0f}s pool)...")
 
         new_clips, new_dur = download_batch_parallel(
-            batch, tmpdir, f"r{round_num}", needed_total - avail, progress, p_start, p_end, max_workers=5)
+            batch, tmpdir, f"r{round_num}", needed_total - avail, progress, p_start, p_end, max_workers=8)
         raw_clips += new_clips
         avail += new_dur
 
     if not raw_clips:
         return None, "⚠ Download failed. Check your internet or API keys."
 
-    if avail < target_secs * 0.85:
-        # Genuinely not enough source footage exists for this category/duration combo
+    if avail < download_target * 0.7:
+        # Even the small fixed pool couldn't be filled — genuine source shortage
         mb_have = int(avail // 60)
-        return None, (f"⚠ Could only gather ~{mb_have}m of usable footage for a "
-                       f"{mins}m{secs_r:02d}s video after {round_num} attempts. "
-                       f"Try selecting more nature categories, or a shorter duration.")
+        return None, (f"⚠ Could only gather ~{mb_have}m of usable footage even for the "
+                       f"{DOWNLOAD_CAP_SECS//60}min base pool after {round_num} attempts. "
+                       f"Try a different nature category — this one may have very limited stock footage.")
 
-    # Build concat list — loop clips using REAL durations until target is covered.
-    # IMPORTANT: ffmpeg's concat demuxer can behave unreliably when the same file
-    # path appears multiple times in the list (some builds stop early after a repeat).
-    # So when we need to loop through raw_clips more than once, we create a unique
-    # hardlink (or copy, as fallback) for each repeated use instead of reusing the path.
+    # ── Loop the fixed pool, SHUFFLED each pass, to cover the FULL target duration ──
+    # The pool covers ~5 min of unique footage; if target_secs is longer than that,
+    # we reshuffle the clip order independently for each loop pass so the same
+    # 20-ish clips don't play in identical sequence every repeat — reduces the
+    # feeling of repetition even though the same source footage is being reused.
     progress(0.50, desc="🎬 Stitching clips...")
     stitched = os.path.join(tmpdir, "stitched.mp4")
     lf = stitched + ".txt"
+    full_needed = target_secs + 30  # actual full duration the user asked for, plus buffer
 
     concat_paths = []
     total_written = 0
-    loops = 0
+    pass_num = 0
     use_index = 0
-    while total_written < needed_total:
-        for clip in raw_clips:
-            if total_written >= needed_total: break
+    while total_written < full_needed:
+        pass_num += 1
+        pass_clips = raw_clips[:]
+        random.shuffle(pass_clips)  # different order each loop pass
+        for clip in pass_clips:
+            if total_written >= full_needed: break
             src = clip["path"]
-            if use_index < len(raw_clips):
-                # first pass through — use original file directly
+            if pass_num == 1:
+                # first pass — use the original downloaded/normalized file directly
                 ref_path = src
             else:
-                # repeat pass — make a distinct reference so ffmpeg sees a unique path
+                # repeat pass — distinct reference so ffmpeg's concat demuxer
+                # never sees the same literal path twice (confirmed bug earlier)
                 ref_path = os.path.join(tmpdir, f"loop_{use_index:04d}.mp4")
                 try:
-                    os.link(src, ref_path)  # hardlink — instant, no extra disk space
+                    os.link(src, ref_path)
                 except OSError:
                     import shutil
-                    shutil.copyfile(src, ref_path)  # fallback if hardlink not supported
+                    shutil.copyfile(src, ref_path)
             concat_paths.append(ref_path)
             total_written += clip["duration"]
             use_index += 1
-        loops += 1
-        if loops > 200: break  # hard safety cap
+        if pass_num > 200: break  # hard safety cap
 
     with open(lf, 'w') as f:
         for p in concat_paths:
@@ -463,7 +476,7 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
     stitch_result = subprocess.run([
         "ffmpeg","-y",
         "-f","concat","-safe","0","-i",lf,
-        "-t",str(needed_total),
+        "-t",str(full_needed),
         "-c","copy","-movflags","+faststart",
         stitched
     ], capture_output=True, text=True, timeout=400)
@@ -473,7 +486,7 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         stitch_result = subprocess.run([
             "ffmpeg","-y",
             "-f","concat","-safe","0","-i",lf,
-            "-t",str(needed_total),
+            "-t",str(full_needed),
             "-vf","scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24",
             "-c:v","libx264","-preset","ultrafast","-crf","28",
             "-an","-threads","4","-movflags","+faststart",
@@ -494,12 +507,12 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         err_tail = (stitch_result.stderr or "")[-500:]
         return None, f"⚠ Stitching failed. FFmpeg error: {err_tail or 'unknown — no output captured'}"
 
-    # verify stitched duration
+    # verify stitched duration matches the FULL target (after looping), not just the pool
     stitched_dur = get_clip_duration(stitched)
     if stitched_dur < target_secs - 5:
         err_tail = (stitch_result.stderr or "")[-300:]
         return None, (f"⚠ Stitched video too short ({stitched_dur:.0f}s vs {target_secs:.0f}s needed) "
-                       f"despite {avail:.0f}s of verified source footage. "
+                       f"after looping a {avail:.0f}s base clip pool {pass_num} times. "
                        f"FFmpeg may have stopped early. Details: {err_tail or 'none captured'}")
 
 
@@ -522,13 +535,13 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
         "Cinematic":"eq=contrast=1.2:saturation=0.8,curves=r='0/0 0.5/0.55 1/1':b='0/0 0.5/0.45 1/0.9'",
         "Moody Dark":"eq=contrast=1.3:brightness=-0.08:saturation=0.75,vignette=PI/3",
     }
-    eff = effect_filters.get(effect,"")
+    effect = gr.Radio(["None"], value="None", visible=False, label="Effect (disabled)")
 
-    try:
-        size_pct = float(img_size.replace('%',''))/100
-    except:
-        size_pct = 0.80
-    img_w = int(1280*size_pct)
+    example_btn.click(
+        fn=fill_example,
+        inputs=None,
+        outputs=[duration_str, nature_cats, effect]
+    )
 
     try:
         spd = float(motion_speed)
