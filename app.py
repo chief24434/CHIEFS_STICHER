@@ -16,42 +16,58 @@ NATURE_QUERIES = {
     "Snow":"snow winter","Fields":"meadow grass","River":"river waterfall","Sky":"clouds sky",
 }
 
+def get_clip_info(path):
+    """
+    Single ffprobe call that returns (duration, width, height) together.
+    Combines what used to be two separate subprocess calls into one —
+    cuts real per-clip overhead roughly in half for this part of verification.
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe","-v","quiet","-print_format","json",
+             "-show_format","-show_streams","-select_streams","v:0",path],
+            capture_output=True, text=True, timeout=10)
+        d = json.loads(r.stdout)
+        dur = float(d.get("format", {}).get("duration", 0))
+        streams = d.get("streams", [])
+        if not streams:
+            return dur, 0, 0
+        w = int(streams[0].get("width", 0))
+        h = int(streams[0].get("height", 0))
+        return dur, w, h
+    except:
+        return 0, 0, 0
+
 def get_clip_duration(path):
-    try:
-        r = subprocess.run(
-            ["ffprobe","-v","quiet","-print_format","json","-show_format",path],
-            capture_output=True, text=True, timeout=10)
-        d = json.loads(r.stdout)
-        return float(d["format"]["duration"])
-    except:
-        return 0
+    """Kept for backward use elsewhere in the file (stitched/output verification)."""
+    dur, _, _ = get_clip_info(path)
+    return dur
 
-def get_clip_dimensions(path):
-    try:
-        r = subprocess.run(
-            ["ffprobe","-v","quiet","-print_format","json","-show_streams","-select_streams","v:0",path],
-            capture_output=True, text=True, timeout=10)
-        d = json.loads(r.stdout)
-        s = d["streams"][0]
-        return int(s.get("width",0)), int(s.get("height",0))
-    except:
-        return 0, 0
-
-def is_static_clip(path, duration):
-    """Detect near-frozen clips by comparing two frames a few seconds apart"""
+def is_static_clip_fast(path, duration):
+    """
+    Lighter static-frame check: extracts TWO tiny frames in a SINGLE ffmpeg call
+    using the 'select' filter, instead of two separate ffmpeg subprocess calls.
+    This roughly halves the subprocess overhead of the old two-call version.
+    """
     try:
         sample_t = min(2.0, max(0.3, duration * 0.3))
-        f1 = path + "_f1.jpg"
-        f2 = path + "_f2.jpg"
-        subprocess.run(["ffmpeg","-y","-ss","0.2","-i",path,"-frames:v","1","-vf","scale=64:36",f1],
-                       capture_output=True, timeout=10)
-        subprocess.run(["ffmpeg","-y","-ss",str(sample_t),"-i",path,"-frames:v","1","-vf","scale=64:36",f2],
-                       capture_output=True, timeout=10)
+        out_pattern = path + "_chk_%d.jpg"
+        # Grab one frame near the start and one a bit later, in one ffmpeg invocation
+        subprocess.run(
+            ["ffmpeg","-y",
+             "-i", path,
+             "-vf", f"select='eq(n\\,0)+eq(n\\,{int(sample_t*24)})',scale=64:36",
+             "-vsync","0",
+             out_pattern],
+            capture_output=True, timeout=12)
+        f1 = path + "_chk_1.jpg"
+        f2 = path + "_chk_2.jpg"
         if not (os.path.exists(f1) and os.path.exists(f2)):
+            # couldn't get two distinct frames — don't block the clip over this
+            for fp in (f1, f2):
+                try: os.remove(fp)
+                except: pass
             return False
-        size1 = os.path.getsize(f1)
-        size2 = os.path.getsize(f2)
-        # Compare raw bytes difference as a cheap proxy for motion
         with open(f1,'rb') as a, open(f2,'rb') as b:
             d1, d2 = a.read(), b.read()
         diff = sum(1 for x,y in zip(d1,d2) if x != y)
@@ -60,7 +76,7 @@ def is_static_clip(path, duration):
         except: pass
         try: os.remove(f2)
         except: pass
-        return ratio < 0.015  # almost no pixel change = static
+        return ratio < 0.015
     except:
         return False
 
@@ -180,14 +196,14 @@ def build_cycling_overlay(valid_imgs, img_w, period, target_secs, stitched, audi
         cmd = (["ffmpeg","-y"] + inputs + [
             "-filter_complex", fc,
             "-map", map_out, "-map", f"{audio_idx}:a",
-            "-c:v","libx264","-preset","fast","-crf","23",
+            "-c:v","libx264","-preset","veryfast","-crf","25",
             "-c:a","aac","-b:a","128k",
             "-t", str(target_secs), output])
     else:
         cmd = (["ffmpeg","-y"] + inputs + [
             "-filter_complex", fc,
             "-map", map_out,
-            "-c:v","libx264","-preset","fast","-crf","23",
+            "-c:v","libx264","-preset","veryfast","-crf","25",
             "-t", str(target_secs), output])
     return cmd
 
@@ -216,7 +232,7 @@ def normalize_one_clip(src_path, dst_path):
              "-c:v","libx264","-preset","ultrafast","-crf","30",
              "-pix_fmt","yuv420p",
              dst_path],
-            capture_output=True, text=True, timeout=90
+            capture_output=True, text=True, timeout=45
         )
     except subprocess.TimeoutExpired:
         # process was killed mid-encode — output file (if any) is unreliable, discard it
@@ -247,11 +263,14 @@ def download_and_verify_one(clip, path, skip_static_check=False):
     """Download one clip and verify it. Returns dict or None."""
     if not download_clip(clip["url"], path):
         return None
-    dur = get_clip_duration(path)
-    w, h = get_clip_dimensions(path)
+
+    # One combined ffprobe call instead of two separate ones
+    dur, w, h = get_clip_info(path)
     valid = dur > 1.5 and w > 0 and h > 0 and w >= h
-    if valid and not skip_static_check and is_static_clip(path, dur):
+
+    if valid and not skip_static_check and is_static_clip_fast(path, dur):
         valid = False
+
     if not valid:
         try: os.remove(path)
         except: pass
@@ -544,17 +563,29 @@ def generate_video(audio_file, duration_str, video_name, images, img_size, motio
             else:
                 cmd = ["ffmpeg","-y","-i",stitched,"-c:v","copy","-t",str(target_secs),output]
 
-    subprocess.run(cmd, capture_output=True, timeout=400)
+    try:
+        proc_result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        overlay_timed_out = False
+        overlay_stderr = proc_result.stderr or ""
+    except subprocess.TimeoutExpired:
+        overlay_timed_out = True
+        overlay_stderr = ""
 
-    if not os.path.exists(output) or os.path.getsize(output) < 1000:
-        if has_audio:
-            subprocess.run(["ffmpeg","-y","-i",stitched,"-i",audio_file,
-                            "-map","0:v","-map","1:a","-c:v","copy",
-                            "-c:a","aac","-b:a","128k","-t",str(target_secs),output],
-                           capture_output=True, timeout=300)
-        else:
-            subprocess.run(["ffmpeg","-y","-i",stitched,"-c:v","copy","-t",str(target_secs),output],
-                           capture_output=True, timeout=300)
+    if overlay_timed_out or not os.path.exists(output) or os.path.getsize(output) < 1000:
+        # Overlay/effects step failed or took too long — fall back to a much simpler,
+        # faster path: copy video stream directly (no overlay motion math, no effect
+        # filter), just attach audio. This guarantees SOME output instead of a hang.
+        try:
+            if has_audio:
+                subprocess.run(["ffmpeg","-y","-i",stitched,"-i",audio_file,
+                                "-map","0:v","-map","1:a","-c:v","copy",
+                                "-c:a","aac","-b:a","128k","-t",str(target_secs),output],
+                               capture_output=True, timeout=300)
+            else:
+                subprocess.run(["ffmpeg","-y","-i",stitched,"-c:v","copy","-t",str(target_secs),output],
+                               capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            pass
 
     if not os.path.exists(output):
         return None, "⚠ Final merge failed."
